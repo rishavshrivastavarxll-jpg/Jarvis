@@ -1,0 +1,5 @@
+flask
+requests
+wikipedia
+SpeechRecognition
+pyaudio # Required for microphone input in SpeechRecognition (install via system package manager if pip fails)

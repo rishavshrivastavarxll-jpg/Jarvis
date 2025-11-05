@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jervis Control Panel</title>
+  <style>
+    body { background:#2c2f33; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; font-family: sans-serif; color:#fff;}
+    .control-panel{ background:#36393f; width:460px; min-height:560px; border-radius:16px; padding:20px; box-sizing:border-box; box-shadow:0 12px 30px rgba(0,0,0,0.5);}
+    .header{ text-align:center; font-size:1.4rem; margin-bottom:16px; }
+    .conversation-box{ background:#23272a; border-radius:8px; padding:10px; height:160px; overflow:auto; font-size:0.95rem; color:#e8e8e8;}
+    .you{ color:#87cefa; margin:6px 0; }
+    .jarvis{ color:#cfcfcf; margin:6px 0; }
+    .status-circle{ width:140px; height:140px; border-radius:50%; background:#30333a; margin:26px auto; display:flex;align-items:center;justify-content:center; border:5px solid rgba(0,191,255,0.15); box-shadow:0 0 14px rgba(0,191,255,0.4); transition:all .3s;}
+    .status-text{ text-align:center; color:#a6a6a6; margin-bottom:14px; }
+    .input-area{ display:flex; gap:8px; align-items:center; }
+    #manualCommand{ flex:1; padding:10px; border-radius:8px; border:none; background:#23272a; color:#fff; outline:none;}
+    button{ padding:10px 12px; border-radius:8px; border:none; cursor:pointer; }
+    #micButton{ background:#4caf50; color:#fff; }
+    #micButton.recording{ background:#ff4500; }
+    #exitButton{ background:#ff4d4d; color:#fff; }
+    @keyframes pulse-jervis { 0%{ box-shadow:0 0 8px rgba(0,191,255,0.35);}50%{ box-shadow:0 0 34px rgba(0,191,255,0.75);}100%{ box-shadow:0 0 8px rgba(0,191,255,0.35);} }
+    .status-circle.responding{ animation:pulse-jervis 1.4s infinite ease-in-out; }
+    .status-circle.speaking{ background:#1e70a3; }
+  </style>
+</head>
+<body>
+  <div class="control-panel">
+    <div class="header">Jervis Control Panel</div>
+
+    <div class="conversation-box" id="conversationBox">
+      <p class="jarvis">Jarvis: {{ initial_greeting }}</p>
+    </div>
+
+    <div class="status-circle" id="statusCircle"></div>
+    <div class="status-text" id="statusText">Status: Idle</div>
+
+    <div class="input-area" style="margin-top:10px;">
+      <input id="manualCommand" type="text" placeholder="Manual Command (press Enter)" />
+      <button id="micButton">🎤 Speak</button>
+      <button id="exitButton">Exit</button>
+    </div>
+  </div>
+
+<script>
+/* ========= DOM refs ========= */
+const conversationBox = document.getElementById('conversationBox');
+const manualCommand = document.getElementById('manualCommand');
+const micButton = document.getElementById('micButton');
+const exitButton = document.getElementById('exitButton');
+const statusText = document.getElementById('statusText');
+const statusCircle = document.getElementById('statusCircle');
+
+/* ========= State ========= */
+let currentAudio = null;          // Audio element currently playing (if any)
+let pendingShutdown = false;      // Whether user requested shutdown while assistant was busy
+let requestInFlight = false;      // Whether a command request is awaiting a response
+let recording = false;            // Controlled elsewhere (your recorder sets this)
+let mediaStream = null;           // if set, used to stop tracks on exit
+let recordedChunks = [];          // recorded audio buffer (if any)
+
+/* ========= Helpers ========= */
+function appendMessage(sender, text) {
+  const p = document.createElement('p');
+  p.className = sender;
+  p.textContent = `${sender.charAt(0).toUpperCase() + sender.slice(1)}: ${text}`;
+  conversationBox.appendChild(p);
+  conversationBox.scrollTop = conversationBox.scrollHeight;
+}
+
+/* ========= TTS playback using Flask generate_audio route ========= */
+function playJervisResponse(text) {
+  if (!text) return;
+
+  // If already an audio playing, stop it (we won't cut off normally, but this is safe)
+  if (currentAudio) {
+    try { currentAudio.pause(); } catch(e){}
+    currentAudio = null;
+  }
+
+  const audioUrl = `/generate_audio?text=${encodeURIComponent(text)}`;
+  const audio = new Audio(audioUrl);
+  currentAudio = audio;
+
+  audio.onplaying = () => {
+    statusText.textContent = 'Status: Speaking...';
+    statusCircle.classList.add('speaking');
+  };
+
+  // When audio ends, clear speaking state and call checkPendingShutdown()
+  audio.onended = () => {
+    currentAudio = null;
+    statusText.textContent = 'Status: Idle';
+    statusCircle.classList.remove('speaking');
+    statusCircle.classList.remove('responding');
+    // If a request was in flight and we've now finished processing,
+    // mark requestInFlight false (safety) and evaluate shutdown.
+    requestInFlight = false;
+    if (pendingShutdown) {
+      performShutdownSequence();
+    }
+  };
+
+  audio.onerror = () => {
+    console.error('Audio playback failed');
+    currentAudio = null;
+    statusText.textContent = 'Status: Idle';
+    statusCircle.classList.remove('speaking');
+    statusCircle.classList.remove('responding');
+    requestInFlight = false;
+    if (pendingShutdown) performShutdownSequence();
+  };
+
+  // Start playback. If autoplay is blocked, the audio play() will reject.
+  audio.play()
+    .catch(err => {
+      console.warn('Autoplay prevented or other audio error:', err);
+      // Still allow shutdown if it was pending - treat as if finished
+      currentAudio = null;
+      statusText.textContent = 'Status: Idle';
+      statusCircle.classList.remove('speaking');
+      statusCircle.classList.remove('responding');
+      requestInFlight = false;
+      if (pendingShutdown) performShutdownSequence();
+    });
+}
+
+/* ========= Manual command handling ========= */
+manualCommand.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    const cmd = manualCommand.value.trim();
+    if (!cmd) return;
+    manualCommand.value = '';
+    appendMessage('you', cmd);
+    sendManualCommand(cmd);
+  }
+});
+
+function sendManualCommand(command) {
+  statusText.textContent = 'Status: Thinking...';
+  statusCircle.classList.add('responding');
+  requestInFlight = true;
+
+  fetch('/command', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ manual_command: command })
+  })
+  .then(r => {
+    requestInFlight = false;
+    if (!r.ok) throw new Error('Network response not ok');
+    return r.json();
+  })
+  .then(data => {
+    const resp = data.response || 'No response from server.';
+    appendMessage('jarvis', resp);
+    // Play response - playJervisResponse will clear requestInFlight on finish
+    playJervisResponse(resp);
+  })
+  .catch(err => {
+    console.error('Manual command error:', err);
+    requestInFlight = false;
+    appendMessage('jarvis', 'Network or server error during manual command.');
+    statusText.textContent = 'Status: Idle';
+    statusCircle.classList.remove('responding');
+    if (pendingShutdown) performShutdownSequence();
+  });
+}
+
+/* ========= Client-side WAV recorder placeholder =========
+   (Your existing recorder code should set `recording`, `mediaStream`
+    and update recordedChunks. The Exit logic below will stop tracks.)
+*/
+
+/* ========= Send audio to Flask (used by your recorder) ========= */
+function sendAudioToFlask(wavBlob) {
+  statusCircle.classList.add('responding');
+  requestInFlight = true;
+
+  const formData = new FormData();
+  formData.append('audio', wavBlob, 'command.wav');
+
+  fetch('/command', { method: 'POST', body: formData })
+    .then(r => {
+      requestInFlight = false;
+      if (!r.ok) throw new Error('Network response not ok');
+      return r.json();
+    })
+    .then(data => {
+      const cmd = data.command || "Audio received but could not be transcribed.";
+      const resp = data.response || "No response.";
+      appendMessage('you', cmd);
+      appendMessage('jarvis', resp);
+      playJervisResponse(resp);
+    })
+    .catch(err => {
+      console.error('sendAudioToFlask error:', err);
+      requestInFlight = false;
+      appendMessage('jarvis', 'Network error or connection failed.');
+      statusText.textContent = 'Status: Idle';
+      statusCircle.classList.remove('responding');
+      if (pendingShutdown) performShutdownSequence();
+    });
+}
+
+/* ========= Shutdown helpers ========= */
+async function performShutdownSequence() {
+  // Only call once
+  if (!pendingShutdown) return;
+  pendingShutdown = false;
+
+  // Stop client-side recording if active (but don't discard completed responses)
+  try {
+    if (recording && mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      recording = false;
+      recordedChunks = []; // prevent sending incomplete audio
+    }
+  } catch (e) {
+    console.warn('Error stopping client recording during shutdown:', e);
+  }
+
+  // Try /shutdown_listener then fallback to /stop_external_listener
+  try {
+    let resp = await fetch('/shutdown_listener', { method: 'POST' });
+    if (resp.ok) {
+      const data = await resp.json().catch(()=>({message:'Listener stopping.'}));
+      appendMessage('jarvis', data.message || 'Listener stopping.');
+      playJervisResponse("Shutting down. Goodbye!");
+      disableUIAfterExit();
+      return;
+    }
+  } catch (e) {
+    console.info('shutdown_listener not available, trying fallback:', e);
+  }
+
+  try {
+    let resp2 = await fetch('/stop_external_listener', { method: 'POST' });
+    if (resp2.ok) {
+      const data = await resp2.json().catch(()=>({message:'External listener stop signal written.'}));
+      appendMessage('jarvis', data.message || 'Stop signal sent to external listener.');
+      playJervisResponse("Shutting down external listener. Goodbye!");
+      disableUIAfterExit();
+      return;
+    } else {
+      appendMessage('jarvis', 'Could not stop listener via server endpoint. Check server logs.');
+    }
+  } catch (e) {
+    console.error('stop_external_listener failed', e);
+    appendMessage('jarvis', 'Failed to contact server to stop listener. Check server logs.');
+  }
+
+  appendMessage('jarvis', 'No stop endpoint available on server. You may need to stop the listener process manually.');
+  statusText.textContent = 'Status: Idle';
+}
+
+function disableUIAfterExit() {
+  micButton.disabled = true;
+  manualCommand.disabled = true;
+  exitButton.disabled = true;
+  statusText.textContent = 'Status: Stopped';
+  statusCircle.classList.remove('responding');
+}
+
+/* ========= EXIT button behavior (deferred shutdown) ========= */
+exitButton.addEventListener('click', () => {
+  // If assistant is currently speaking or processing, set pendingShutdown and let it finish.
+  const isSpeaking = !!currentAudio;
+  const isThinking = statusCircle.classList.contains('responding') || requestInFlight;
+
+  if (isSpeaking || isThinking) {
+    pendingShutdown = true;
+    appendMessage('jarvis', "Okay — I'll shut down after I finish this response.");
+    // If not speaking but thinking, we still wait until requestInFlight becomes false /
+    // playJervisResponse or error handler will call performShutdownSequence() when done.
+    // If already speaking, playJervisResponse's onended will call performShutdownSequence().
+    return;
+  }
+
+  // Otherwise safe to shut down immediately
+  pendingShutdown = false;
+  performShutdownSequence();
+});
+
+/* optional: update UI when leaving page to ensure mic releases */
+window.addEventListener('beforeunload', () => {
+  try { if (mediaStream) mediaStream.getTracks().forEach(t => t.stop()); } catch(e){}
+});
+</script>
+
+</body>
+</html>
